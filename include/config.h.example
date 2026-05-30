@@ -1,0 +1,8 @@
+#pragma once
+
+#define WIFI_SSID "your-ssid"
+#define WIFI_PASSWORD "your-password"
+
+#define API_BASE_URL "http://192.168.0.10:8000"
+#define INGEST_TOKEN "replace-with-uuid-from-seed_dev"
+#define FIRMWARE_VERSION "dev-local"

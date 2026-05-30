@@ -4,13 +4,13 @@
 
 Прошивка **BeePlan** для концентратора: приём **ESP‑NOW** от ульевых модулей, упаковка JSON и `POST /v1/telemetry/batch` с заголовком `Authorization: Bearer <ingest_token>`.
 
+**Рекомендуемая установка:** веб-мастер в [beeplan-web](https://github.com/4sidora/beeplan-web) (`/install/gateway`). После boot шлёт `POST /v1/concentrators/heartbeat` с MAC.
+
 В MVP uplink через **Wi‑Fi** (проще отладить). GSM (TinyGSM) добавляется отдельной конфигурацией сборки.
 
-## Настройка
+## Настройка (ручная)
 
-Отредактируйте `include/config.h`: SSID/пароль Wi‑Fi, URL API (например `http://192.168.1.10:8000`), `INGEST_TOKEN` из вывода `python -m beeplan.seed_dev`.
-
-MAC ESP32 концентратора нужно прописать в `beeplan-edge/include/config.h` как `GATEWAY_MAC`.
+Скопируйте `include/config.h.example` → `include/config.h`: SSID/пароль Wi‑Fi, URL API, `INGEST_TOKEN`.
 
 ## Сборка
 

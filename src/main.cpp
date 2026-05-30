@@ -27,8 +27,8 @@ struct __attribute__((packed)) Envelope {
 volatile bool g_have_packet = false;
 Envelope g_last{};
 
-void on_recv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
-  (void)info;
+void on_recv(const uint8_t* mac, const uint8_t* data, int len) {
+  (void)mac;
   if (len != static_cast<int>(sizeof(Envelope))) {
     return;
   }
@@ -85,6 +85,45 @@ const char* metric_name(uint8_t m) {
   }
 }
 
+bool post_heartbeat() {
+  WiFiClient client;
+  HTTPClient http;
+  String url = String(API_BASE_URL) + "/v1/concentrators/heartbeat";
+  if (!http.begin(client, url)) {
+    Serial.println("heartbeat: http.begin failed");
+    return false;
+  }
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", String("Bearer ") + INGEST_TOKEN);
+
+  JsonDocument doc;
+  doc["mac"] = WiFi.macAddress();
+  doc["firmware_version"] = FIRMWARE_VERSION;
+  String body;
+  serializeJson(doc, body);
+
+  int code = http.POST(body);
+  Serial.printf("POST /v1/concentrators/heartbeat -> %d mac=%s\n", code, WiFi.macAddress().c_str());
+  if (code < 200 || code >= 300) {
+    Serial.println(http.getString());
+    http.end();
+    return false;
+  }
+  http.end();
+  return true;
+}
+
+void send_heartbeat_with_retry() {
+  Serial.printf("Gateway MAC: %s\n", WiFi.macAddress().c_str());
+  for (int i = 0; i < 20; ++i) {
+    if (post_heartbeat()) {
+      return;
+    }
+    delay(3000);
+  }
+  Serial.println("heartbeat failed after retries");
+}
+
 bool post_batch(JsonDocument& batchRoot) {
   if (!batchRoot["samples"].is<JsonArray>()) {
     return true;
@@ -124,6 +163,11 @@ void setup() {
   delay(300);
   Serial.println("BeePlan gateway");
 
+  // ESP-NOW requires Wi-Fi stack to be up before esp_now_init().
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true);
+  delay(100);
+
   if (esp_now_init() != ESP_OK) {
     Serial.println("esp_now_init failed");
     abort();
@@ -135,6 +179,7 @@ void setup() {
   } else {
     Serial.println(WiFi.localIP());
     sync_time_utc();
+    send_heartbeat_with_retry();
   }
 }
 
