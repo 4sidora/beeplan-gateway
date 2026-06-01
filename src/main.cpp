@@ -8,6 +8,8 @@
 #include <esp_now.h>
 #include <time.h>
 
+#include "beeplan_io.h"
+#include "beeplan_espnow.h"
 #include "config.h"
 
 namespace {
@@ -24,22 +26,68 @@ struct __attribute__((packed)) Envelope {
   int16_t i16_b;
 };
 
-volatile bool g_have_packet = false;
-Envelope g_last{};
+constexpr size_t kRxQueueCap = 32;
+Envelope g_rx_queue[kRxQueueCap];
+volatile uint16_t g_rx_head = 0;
+volatile uint16_t g_rx_tail = 0;
+portMUX_TYPE g_rx_mux = portMUX_INITIALIZER_UNLOCKED;
 
-void on_recv(const uint8_t* mac, const uint8_t* data, int len) {
+bool is_channel_probe(const Envelope& e) {
+  return e.unix_ts == 0 && e.metric == 0 && e.i16_a == 0 && e.i16_b == 0;
+}
+
+bool rx_queue_push(const Envelope& e) {
+  portENTER_CRITICAL(&g_rx_mux);
+  const uint16_t next = static_cast<uint16_t>((g_rx_head + 1) % kRxQueueCap);
+  if (next == g_rx_tail) {
+    portEXIT_CRITICAL(&g_rx_mux);
+    BEE_SERIAL.println("ESP-NOW rx queue full — dropped packet");
+    return false;
+  }
+  g_rx_queue[g_rx_head] = e;
+  g_rx_head = next;
+  portEXIT_CRITICAL(&g_rx_mux);
+  return true;
+}
+
+bool rx_queue_pop(Envelope& out) {
+  portENTER_CRITICAL(&g_rx_mux);
+  if (g_rx_tail == g_rx_head) {
+    portEXIT_CRITICAL(&g_rx_mux);
+    return false;
+  }
+  out = g_rx_queue[g_rx_tail];
+  g_rx_tail = static_cast<uint16_t>((g_rx_tail + 1) % kRxQueueCap);
+  portEXIT_CRITICAL(&g_rx_mux);
+  return true;
+}
+
+void on_recv_legacy(const uint8_t* mac, const uint8_t* data, int len) {
   (void)mac;
   if (len != static_cast<int>(sizeof(Envelope))) {
+    BEE_SERIAL.printf("ESP-NOW bad len=%d want=%u\n", len, static_cast<unsigned>(sizeof(Envelope)));
     return;
   }
   Envelope tmp;
   memcpy(&tmp, data, sizeof(Envelope));
   if (tmp.magic != kMagic) {
+    BEE_SERIAL.println("ESP-NOW bad magic");
     return;
   }
-  g_last = tmp;
-  g_have_packet = true;
+  if (is_channel_probe(tmp)) {
+    return;
+  }
+  if (rx_queue_push(tmp)) {
+    BEE_SERIAL.printf("ESP-NOW rx id=%s metric=%u\n", tmp.device_id, static_cast<unsigned>(tmp.metric));
+  }
 }
+
+#if BEEPLAN_ESPNOW_V3
+void on_recv_v3(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+  (void)info;
+  on_recv_legacy(nullptr, data, len);
+}
+#endif
 
 bool wifi_connect() {
   WiFi.mode(WIFI_STA);
@@ -90,7 +138,7 @@ bool post_heartbeat() {
   HTTPClient http;
   String url = String(API_BASE_URL) + "/v1/concentrators/heartbeat";
   if (!http.begin(client, url)) {
-    Serial.println("heartbeat: http.begin failed");
+    BEE_SERIAL.println("heartbeat: http.begin failed");
     return false;
   }
   http.addHeader("Content-Type", "application/json");
@@ -103,9 +151,9 @@ bool post_heartbeat() {
   serializeJson(doc, body);
 
   int code = http.POST(body);
-  Serial.printf("POST /v1/concentrators/heartbeat -> %d mac=%s\n", code, WiFi.macAddress().c_str());
+  BEE_SERIAL.printf("POST /v1/concentrators/heartbeat -> %d mac=%s\n", code, WiFi.macAddress().c_str());
   if (code < 200 || code >= 300) {
-    Serial.println(http.getString());
+    BEE_SERIAL.println(http.getString());
     http.end();
     return false;
   }
@@ -114,14 +162,14 @@ bool post_heartbeat() {
 }
 
 void send_heartbeat_with_retry() {
-  Serial.printf("Gateway MAC: %s\n", WiFi.macAddress().c_str());
+  BEE_SERIAL.printf("Gateway MAC: %s\n", WiFi.macAddress().c_str());
   for (int i = 0; i < 20; ++i) {
     if (post_heartbeat()) {
       return;
     }
     delay(3000);
   }
-  Serial.println("heartbeat failed after retries");
+  BEE_SERIAL.println("heartbeat failed after retries");
 }
 
 bool post_batch(JsonDocument& batchRoot) {
@@ -136,7 +184,7 @@ bool post_batch(JsonDocument& batchRoot) {
   HTTPClient http;
   String url = String(API_BASE_URL) + "/v1/telemetry/batch";
   if (!http.begin(client, url)) {
-    Serial.println("http.begin failed");
+    BEE_SERIAL.println("http.begin failed");
     return false;
   }
   http.addHeader("Content-Type", "application/json");
@@ -146,9 +194,9 @@ bool post_batch(JsonDocument& batchRoot) {
   serializeJson(batchRoot, body);
 
   int code = http.POST(body);
-  Serial.printf("POST /v1/telemetry/batch -> %d\n", code);
+  BEE_SERIAL.printf("POST /v1/telemetry/batch -> %d\n", code);
   if (code < 200 || code >= 300) {
-    Serial.println(http.getString());
+    BEE_SERIAL.println(http.getString());
     http.end();
     return false;
   }
@@ -156,31 +204,79 @@ bool post_batch(JsonDocument& batchRoot) {
   return true;
 }
 
+void append_sample(JsonArray& samples, const Envelope& e) {
+  time_t ts = static_cast<time_t>(e.unix_ts);
+  if (ts < 1700000000) {
+    ts = time(nullptr);
+  }
+
+  JsonObject s = samples.add<JsonObject>();
+  s["device_public_id"] = String(e.device_id);
+  s["metric"] = metric_name(e.metric);
+  s["ts"] = format_iso_utc(ts);
+  if (e.metric == 0) {
+    JsonObject v = s["value"].to<JsonObject>();
+    v["celsius"] = e.i16_a / 100.0f;
+  } else if (e.metric == 1) {
+    JsonObject v = s["value"].to<JsonObject>();
+    v["percent"] = e.i16_a / 100.0f;
+  } else {
+    JsonObject v = s["value"].to<JsonObject>();
+    v["placeholder"] = e.i16_a;
+  }
+}
+
 }  // namespace
 
 void setup() {
-  Serial.begin(115200);
-  delay(300);
-  Serial.println("BeePlan gateway");
+  beeplan_led_init();
+  beeplan_serial_begin();
+  BEE_SERIAL.printf("BeePlan gateway %s\n", FIRMWARE_SERIAL_TAG);
+#if BEEPLAN_ESPNOW_V3
+  BEE_SERIAL.println("ESP-NOW callbacks: IDF5/v3");
+#else
+  BEE_SERIAL.println("ESP-NOW callbacks: legacy");
+#endif
+  BEE_SERIAL.printf("sizeof(Envelope)=%u\n", static_cast<unsigned>(sizeof(Envelope)));
 
-  // ESP-NOW requires Wi-Fi stack to be up before esp_now_init().
   WiFi.mode(WIFI_STA);
-  WiFi.disconnect(true);
-  delay(100);
-
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("esp_now_init failed");
-    abort();
-  }
-  esp_now_register_recv_cb(on_recv);
+  WiFi.setSleep(false);
 
   if (!wifi_connect()) {
-    Serial.println("WiFi failed — uplink disabled until reboot");
-  } else {
-    Serial.println(WiFi.localIP());
-    sync_time_utc();
-    send_heartbeat_with_retry();
+    BEE_SERIAL.println("WiFi failed — reboot after fixing credentials");
+    return;
   }
+
+  BEE_SERIAL.println(WiFi.localIP());
+  BEE_SERIAL.printf("WiFi channel=%d (ESP-NOW uses this channel)\n", WiFi.channel());
+
+  if (esp_now_init() != ESP_OK) {
+    BEE_SERIAL.println("esp_now_init failed — halted");
+    while (true) {
+      beeplan_led_toggle();
+      delay(150);
+    }
+  }
+#if BEEPLAN_ESPNOW_V3
+  if (!beeplan_register_recv_cb(on_recv_v3)) {
+    BEE_SERIAL.println("recv_cb register failed — halted");
+    while (true) {
+      beeplan_led_toggle();
+      delay(150);
+    }
+  }
+#else
+  if (!beeplan_register_recv_cb(on_recv_legacy)) {
+    BEE_SERIAL.println("recv_cb register failed — halted");
+    while (true) {
+      beeplan_led_toggle();
+      delay(150);
+    }
+  }
+#endif
+
+  sync_time_utc();
+  send_heartbeat_with_retry();
 }
 
 void loop() {
@@ -188,33 +284,13 @@ void loop() {
   static JsonArray samples = batch["samples"].to<JsonArray>();
   static uint32_t last_flush = 0;
 
-  if (g_have_packet) {
-    g_have_packet = false;
-    Envelope e = g_last;
-
-    time_t ts = static_cast<time_t>(e.unix_ts);
-    if (ts < 1700000000) {
-      ts = time(nullptr);
-    }
-
-    JsonObject s = samples.add<JsonObject>();
-    s["device_public_id"] = String(e.device_id);
-    s["metric"] = metric_name(e.metric);
-    s["ts"] = format_iso_utc(ts);
-    if (e.metric == 0) {
-      JsonObject v = s["value"].to<JsonObject>();
-      v["celsius"] = e.i16_a / 100.0f;
-    } else if (e.metric == 1) {
-      JsonObject v = s["value"].to<JsonObject>();
-      v["percent"] = e.i16_a / 100.0f;
-    } else {
-      JsonObject v = s["value"].to<JsonObject>();
-      v["placeholder"] = e.i16_a;
-    }
+  Envelope e{};
+  while (rx_queue_pop(e)) {
+    append_sample(samples, e);
   }
 
   uint32_t now_ms = millis();
-  bool due = (samples.size() >= 8) || (samples.size() > 0 && (now_ms - last_flush) > 30000U);
+  bool due = (samples.size() >= 2) || (samples.size() > 0 && (now_ms - last_flush) > 5000U);
 
   if (WiFi.status() == WL_CONNECTED && due) {
     if (post_batch(batch)) {

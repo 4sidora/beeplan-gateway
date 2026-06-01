@@ -9,5 +9,8 @@
 /** Токен концентратора (ingest_token) из BeePlan API. */
 #define INGEST_TOKEN "{{INGEST_TOKEN}}"
 
-/** Версия прошивки (semver или git tag). */
+/** Semver (0.1.2). */
 #define FIRMWARE_VERSION "{{FIRMWARE_VERSION}}"
+
+/** Полное имя в Serial: beeplan-Gateway-0.1.2 */
+#define FIRMWARE_SERIAL_TAG "{{FIRMWARE_SERIAL_TAG}}"
