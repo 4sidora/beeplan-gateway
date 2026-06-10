@@ -24,6 +24,9 @@ constexpr uint8_t kMetricBattery = 0x08;
 constexpr uint8_t kMetricFirmware = 0x10;
 constexpr uint8_t kMetricAudio = 0x20;
 
+/** Минимальный валидный unix_ts (~2023-11). Ниже — в поле несёт NVS-счётчик edge. */
+constexpr uint32_t kMinValidUnixTs = 1700000000U;
+
 struct __attribute__((packed)) EnvelopeV1 {
   uint32_t magic;
   uint8_t proto_version;

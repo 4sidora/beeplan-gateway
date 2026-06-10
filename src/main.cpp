@@ -6,6 +6,7 @@
 #include <FS.h>
 #include <HTTPClient.h>
 #include <LittleFS.h>
+#include <Preferences.h>
 #include <WiFi.h>
 #include <cstring>
 #include <esp_now.h>
@@ -22,7 +23,13 @@ namespace {
 constexpr size_t kRxQueueCap = 512;
 constexpr uint32_t kHeartbeatIntervalMs = 15U * 60U * 1000U;
 constexpr uint32_t kDrainIntervalMs = 30U * 1000U;
+constexpr size_t kMaxSpoolLinesPerBatch = 32;
+constexpr size_t kMaxSamplesPerBatch = 96;
 constexpr char kSpoolPath[] = "/beeplan_spool.jsonl";
+constexpr char kPrefsNamespace[] = "beeplan";
+constexpr char kPrefsGwReportSeq[] = "gw_report_seq";
+
+Preferences g_prefs;
 
 struct RxV1Item {
   EnvelopeV1 envelope;
@@ -138,6 +145,9 @@ void handle_v2(const uint8_t* mac, const uint8_t* data, int len) {
   if (tmp.magic != kBeeplanMagicV2 || tmp.proto_version != kBeeplanProtoV2) {
     return;
   }
+  // ACK сразу — edge ждёт ответ ~300 мс после отправки.
+  send_ack_v2(tmp, mac);
+
   RxItem item{};
   item.kind = RxKind::V2;
   item.v2.frame = tmp;
@@ -220,11 +230,17 @@ float gateway_battery_demo_percent() {
 }
 
 bool spool_init() {
-  if (LittleFS.begin(true)) {
-    return true;
+  if (!LittleFS.begin(true)) {
+    BEE_SERIAL.println("WARN: LittleFS mount failed — spool disabled");
+    return false;
   }
-  BEE_SERIAL.println("WARN: LittleFS mount failed — spool disabled");
-  return false;
+  if (!LittleFS.exists(kSpoolPath)) {
+    File f = LittleFS.open(kSpoolPath, "w");
+    if (f) {
+      f.close();
+    }
+  }
+  return true;
 }
 
 void spool_recount() {
@@ -295,12 +311,8 @@ void send_heartbeat_with_retry() {
   BEE_SERIAL.println("heartbeat failed after retries");
 }
 
-bool post_batch(JsonDocument& batchRoot, JsonArray& accepted_ids) {
-  if (!batchRoot["samples"].is<JsonArray>()) {
-    return true;
-  }
-  JsonArray samples = batchRoot["samples"].as<JsonArray>();
-  if (samples.size() == 0) {
+bool post_batch_body(const String& body, size_t sample_count, JsonArray& accepted_ids) {
+  if (sample_count == 0) {
     return true;
   }
   WiFiClient client;
@@ -312,12 +324,9 @@ bool post_batch(JsonDocument& batchRoot, JsonArray& accepted_ids) {
   http.addHeader("Content-Type", "application/json");
   http.addHeader("Authorization", String("Bearer ") + INGEST_TOKEN);
 
-  String body;
-  serializeJson(batchRoot, body);
-
   const int code = http.POST(body);
   BEE_SERIAL.printf("POST /v1/telemetry/batch -> %d samples=%u\n", code,
-                    static_cast<unsigned>(samples.size()));
+                    static_cast<unsigned>(sample_count));
   if (code < 200 || code >= 300) {
     BEE_SERIAL.println(http.getString());
     http.end();
@@ -334,6 +343,19 @@ bool post_batch(JsonDocument& batchRoot, JsonArray& accepted_ids) {
     }
   }
   return true;
+}
+
+bool post_batch(JsonDocument& batchRoot, JsonArray& accepted_ids) {
+  if (!batchRoot["samples"].is<JsonArray>()) {
+    return true;
+  }
+  JsonArray samples = batchRoot["samples"].as<JsonArray>();
+  if (samples.size() == 0) {
+    return true;
+  }
+  String body;
+  serializeJson(batchRoot, body);
+  return post_batch_body(body, samples.size(), accepted_ids);
 }
 
 void append_v1_sample(JsonArray& samples, const EnvelopeV1& e) {
@@ -373,16 +395,35 @@ void append_v1_sample(JsonArray& samples, const EnvelopeV1& e) {
   }
 }
 
+uint32_t next_gateway_report_seq() {
+  g_prefs.begin(kPrefsNamespace, false);
+  uint32_t seq = g_prefs.getUInt(kPrefsGwReportSeq, 0);
+  ++seq;
+  g_prefs.putUInt(kPrefsGwReportSeq, seq);
+  g_prefs.end();
+  return seq;
+}
+
 String make_report_id(const ReportFrameV2& frame) {
-  char buf[96];
-  snprintf(buf, sizeof(buf), "%s:%lu:%u", frame.device_id,
-           static_cast<unsigned long>(frame.unix_ts), static_cast<unsigned>(frame.seq));
+  char buf[128];
+  const uint32_t ts = frame.unix_ts;
+  if (ts >= kMinValidUnixTs) {
+    snprintf(buf, sizeof(buf), "%s:%lu:%u", frame.device_id, static_cast<unsigned long>(ts),
+             static_cast<unsigned>(frame.seq));
+  } else if (ts > 0) {
+    // Edge без NTP: unix_ts = NVS-счётчик отчётов на устройстве.
+    snprintf(buf, sizeof(buf), "%s:nvs:%lu", frame.device_id, static_cast<unsigned long>(ts));
+  } else {
+    // Старая прошивка edge (unix_ts=0): монотонный счётчик gateway в NVS.
+    const uint32_t gw_seq = next_gateway_report_seq();
+    snprintf(buf, sizeof(buf), "%s:gw:%lu", frame.device_id, static_cast<unsigned long>(gw_seq));
+  }
   return String(buf);
 }
 
 void append_v2_samples(JsonArray& samples, const ReportFrameV2& frame, const String& report_id) {
   time_t ts = static_cast<time_t>(frame.unix_ts);
-  if (ts < 1700000000) {
+  if (ts < static_cast<time_t>(kMinValidUnixTs)) {
     ts = time(nullptr);
   }
   const String iso = format_iso_utc(ts);
@@ -445,7 +486,6 @@ void process_v2_item(const RxV2Item& item) {
   if (!spool_append_line(spool_line)) {
     BEE_SERIAL.println("WARN: spool append failed");
   }
-  send_ack_v2(item.frame, item.src_mac);
 }
 
 void flush_ram_queue(JsonDocument& batch) {
@@ -505,37 +545,151 @@ bool remove_accepted_from_spool(const JsonArray& accepted_ids) {
   return true;
 }
 
-void drain_spool(JsonDocument& batch, JsonArray& report_ids_out) {
+bool drop_first_spool_line() {
   if (!LittleFS.exists(kSpoolPath)) {
-    return;
+    return false;
+  }
+  File in = LittleFS.open(kSpoolPath, "r");
+  if (!in) {
+    return false;
+  }
+  File out = LittleFS.open("/beeplan_spool.tmp", "w");
+  if (!out) {
+    in.close();
+    return false;
+  }
+
+  bool skipped = false;
+  while (in.available()) {
+    String line = in.readStringUntil('\n');
+    line.trim();
+    if (!skipped && line.length() >= 3) {
+      skipped = true;
+      continue;
+    }
+    if (line.length() >= 3) {
+      out.println(line);
+    }
+  }
+  in.close();
+  out.close();
+  LittleFS.remove(kSpoolPath);
+  LittleFS.rename("/beeplan_spool.tmp", kSpoolPath);
+  spool_recount();
+  return skipped;
+}
+
+bool read_first_spool_line(String& line_out) {
+  line_out = "";
+  if (!LittleFS.exists(kSpoolPath)) {
+    return false;
   }
   File f = LittleFS.open(kSpoolPath, "r");
   if (!f) {
-    return;
+    return false;
   }
-  JsonArray samples = batch["samples"].to<JsonArray>();
   while (f.available()) {
     String line = f.readStringUntil('\n');
     line.trim();
     if (line.length() < 3) {
       continue;
     }
+    line_out = line;
+    break;
+  }
+  f.close();
+  return line_out.length() >= 3;
+}
+
+void drop_corrupt_spool_head() {
+  for (;;) {
+    String line;
+    if (!read_first_spool_line(line)) {
+      return;
+    }
     JsonDocument doc;
-    if (deserializeJson(doc, line) != DeserializationError::Ok) {
+    if (deserializeJson(doc, line) == DeserializationError::Ok &&
+        doc["samples"].is<JsonArray>() && doc["samples"].as<JsonArray>().size() > 0) {
+      return;
+    }
+    BEE_SERIAL.println("WARN: drop corrupt spool head");
+    drop_first_spool_line();
+  }
+}
+
+/** Собирает один JSON batch из RAM-очереди и строк spool (без merge JsonDocument). */
+bool build_uplink_body(String& body_out, JsonArray& report_ids_out, JsonDocument& ram_batch,
+                       size_t& spool_lines_out, size_t& sample_count_out) {
+  spool_lines_out = 0;
+  sample_count_out = 0;
+  body_out = "{\"samples\":[";
+  bool first_sample = true;
+
+  if (ram_batch["samples"].is<JsonArray>()) {
+    for (JsonObject s : ram_batch["samples"].as<JsonArray>()) {
+      if (!first_sample) {
+        body_out += ',';
+      }
+      String frag;
+      serializeJson(s, frag);
+      body_out += frag;
+      first_sample = false;
+      ++sample_count_out;
+    }
+  }
+
+  drop_corrupt_spool_head();
+  if (!LittleFS.exists(kSpoolPath)) {
+    body_out += "]}";
+    return sample_count_out > 0;
+  }
+  File f = LittleFS.open(kSpoolPath, "r");
+  if (!f) {
+    body_out += "]}";
+    return sample_count_out > 0;
+  }
+
+  while (f.available() && spool_lines_out < kMaxSpoolLinesPerBatch &&
+         sample_count_out < kMaxSamplesPerBatch) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() < 3) {
       continue;
     }
-    const char* rid = doc["report_id"] | "";
+
+    JsonDocument line_doc;
+    const DeserializationError err = deserializeJson(line_doc, line);
+    if (err) {
+      BEE_SERIAL.printf("WARN: spool line parse: %s\n", err.c_str());
+      break;
+    }
+    JsonArray line_samples = line_doc["samples"].as<JsonArray>();
+    if (line_samples.size() == 0) {
+      continue;
+    }
+
+    const char* rid = line_doc["report_id"] | "";
     if (rid[0] != '\0') {
       report_ids_out.add(rid);
     }
-    if (!doc["samples"].is<JsonArray>()) {
-      continue;
+    for (JsonObject s : line_samples) {
+      if (sample_count_out >= kMaxSamplesPerBatch) {
+        break;
+      }
+      if (!first_sample) {
+        body_out += ',';
+      }
+      String frag;
+      serializeJson(s, frag);
+      body_out += frag;
+      first_sample = false;
+      ++sample_count_out;
     }
-    for (JsonObject s : doc["samples"].as<JsonArray>()) {
-      samples.add(s);
-    }
+    ++spool_lines_out;
   }
   f.close();
+  body_out += "]}";
+  return sample_count_out > 0;
 }
 
 void try_uplink() {
@@ -543,30 +697,41 @@ void try_uplink() {
     return;
   }
 
-  JsonDocument batch;
-  JsonDocument sent_ids_doc;
-  JsonArray sent_report_ids = sent_ids_doc.to<JsonArray>();
-  flush_ram_queue(batch);
-  drain_spool(batch, sent_report_ids);
+  JsonDocument ram_batch;
+  flush_ram_queue(ram_batch);
 
-  JsonArray samples = batch["samples"].to<JsonArray>();
-  if (samples.size() == 0) {
+  JsonDocument report_ids_doc;
+  JsonArray pending_report_ids = report_ids_doc.to<JsonArray>();
+
+  String body;
+  size_t spool_lines = 0;
+  size_t sample_count = 0;
+  if (!build_uplink_body(body, pending_report_ids, ram_batch, spool_lines, sample_count)) {
+    if (g_spool_pending_count > 0) {
+      BEE_SERIAL.printf("WARN: spool=%u but batch empty\n",
+                        static_cast<unsigned>(g_spool_pending_count));
+    }
     g_drain_backoff_ms = kDrainIntervalMs;
     return;
   }
 
   JsonDocument accepted_doc;
   JsonArray accepted_ids = accepted_doc.to<JsonArray>();
-  if (post_batch(batch, accepted_ids)) {
-    if (accepted_ids.size() == 0 && sent_report_ids.size() > 0) {
-      remove_accepted_from_spool(sent_report_ids);
-    } else if (accepted_ids.size() > 0) {
-      remove_accepted_from_spool(accepted_ids);
-    }
-    g_drain_backoff_ms = kDrainIntervalMs;
-  } else {
+  if (!post_batch_body(body, sample_count, accepted_ids)) {
     g_drain_backoff_ms = min<uint32_t>(g_drain_backoff_ms * 2, 15U * 60U * 1000U);
+    return;
   }
+
+  if (accepted_ids.size() > 0) {
+    remove_accepted_from_spool(accepted_ids);
+  } else if (pending_report_ids.size() > 0) {
+    remove_accepted_from_spool(pending_report_ids);
+  }
+
+  BEE_SERIAL.printf("drain ok: spool_lines=%u samples=%u pending=%u\n",
+                    static_cast<unsigned>(spool_lines), static_cast<unsigned>(sample_count),
+                    static_cast<unsigned>(g_spool_pending_count));
+  g_drain_backoff_ms = kDrainIntervalMs;
 }
 
 }  // namespace
