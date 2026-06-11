@@ -11,6 +11,7 @@
 #include <cstring>
 #include <esp_now.h>
 #include <esp_random.h>
+#include <esp_wifi.h>
 #include <time.h>
 
 #include "beeplan_io.h"
@@ -26,10 +27,61 @@ constexpr uint32_t kDrainIntervalMs = 30U * 1000U;
 constexpr size_t kMaxSpoolLinesPerBatch = 32;
 constexpr size_t kMaxSamplesPerBatch = 96;
 constexpr char kSpoolPath[] = "/beeplan_spool.jsonl";
+constexpr char kSpoolTmpPath[] = "/beeplan_spool.tmp";
+/** Мягкий лимит строк spool; при превышении — отбрасываем старые. */
+constexpr uint16_t kSpoolSoftMaxLines = 400;
+/** Запас свободного места для перезаписи spool (байт). */
+constexpr size_t kSpoolCompactReserveBytes = 32768;
 constexpr char kPrefsNamespace[] = "beeplan";
 constexpr char kPrefsGwReportSeq[] = "gw_report_seq";
 
 Preferences g_prefs;
+
+struct EdgeWakeConfig {
+  char public_id[33]{};
+  uint16_t wake_interval_sec = 0;
+};
+
+constexpr size_t kMaxEdgeWakeConfigs = 100;
+EdgeWakeConfig g_edge_wake_configs[kMaxEdgeWakeConfigs];
+size_t g_edge_wake_count = 0;
+
+void load_edge_wake_configs(const JsonDocument& doc) {
+  g_edge_wake_count = 0;
+  JsonArrayConst arr = doc["edge_devices"].as<JsonArrayConst>();
+  if (arr.isNull()) {
+    return;
+  }
+  for (JsonObjectConst item : arr) {
+    if (g_edge_wake_count >= kMaxEdgeWakeConfigs) {
+      break;
+    }
+    const char* pid = item["public_id"] | "";
+    if (pid[0] == '\0') {
+      continue;
+    }
+    EdgeWakeConfig& slot = g_edge_wake_configs[g_edge_wake_count++];
+    strncpy(slot.public_id, pid, sizeof(slot.public_id) - 1);
+    const int wake = item["wake_interval_sec"] | 3600;
+    if (wake >= 10 && wake <= 86400) {
+      slot.wake_interval_sec = static_cast<uint16_t>(wake);
+    } else {
+      slot.wake_interval_sec = 3600;
+    }
+  }
+}
+
+uint16_t wake_interval_for_public_id(const char* device_id) {
+  if (device_id == nullptr) {
+    return 0;
+  }
+  for (size_t i = 0; i < g_edge_wake_count; ++i) {
+    if (strcmp(g_edge_wake_configs[i].public_id, device_id) == 0) {
+      return g_edge_wake_configs[i].wake_interval_sec;
+    }
+  }
+  return 0;
+}
 
 struct RxV1Item {
   EnvelopeV1 envelope;
@@ -38,6 +90,8 @@ struct RxV1Item {
 struct RxV2Item {
   ReportFrameV2 frame;
   uint8_t src_mac[6];
+  /** RSSI приёма пакета на gateway (dBm); -127 если недоступен. */
+  int8_t rx_rssi_dbm;
 };
 
 enum class RxKind : uint8_t { V1, V2 };
@@ -59,6 +113,114 @@ uint32_t g_last_heartbeat_ms = 0;
 uint32_t g_last_drain_ms = 0;
 uint32_t g_drain_backoff_ms = kDrainIntervalMs;
 uint16_t g_spool_pending_count = 0;
+
+/** ESP-IDF 4.x ESP-NOW recv_cb не отдаёт RSSI — кэш из promiscuous mode. */
+constexpr size_t kRssiCacheSlots = 8;
+constexpr uint32_t kRssiCacheTtlMs = 500;
+
+struct RssiCacheSlot {
+  uint8_t mac[6]{};
+  int8_t rssi_dbm = -127;
+  uint32_t seen_ms = 0;
+};
+
+RssiCacheSlot g_rssi_cache[kRssiCacheSlots];
+portMUX_TYPE g_rssi_mux = portMUX_INITIALIZER_UNLOCKED;
+
+bool mac_equal(const uint8_t* a, const uint8_t* b) {
+  return memcmp(a, b, 6) == 0;
+}
+
+bool rssi_dbm_valid(int8_t rssi_dbm) {
+  return rssi_dbm < 0 && rssi_dbm > -120;
+}
+
+void rssi_cache_store(const uint8_t* mac, int8_t rssi_dbm) {
+  if (mac == nullptr || !rssi_dbm_valid(rssi_dbm)) {
+    return;
+  }
+  const uint32_t now = millis();
+  portENTER_CRITICAL(&g_rssi_mux);
+  for (auto& slot : g_rssi_cache) {
+    if (mac_equal(slot.mac, mac)) {
+      slot.rssi_dbm = rssi_dbm;
+      slot.seen_ms = now;
+      portEXIT_CRITICAL(&g_rssi_mux);
+      return;
+    }
+  }
+  size_t replace_idx = 0;
+  uint32_t oldest_ms = UINT32_MAX;
+  for (size_t i = 0; i < kRssiCacheSlots; ++i) {
+    if (g_rssi_cache[i].seen_ms == 0) {
+      replace_idx = i;
+      oldest_ms = 0;
+      break;
+    }
+    if (g_rssi_cache[i].seen_ms < oldest_ms) {
+      oldest_ms = g_rssi_cache[i].seen_ms;
+      replace_idx = i;
+    }
+  }
+  memcpy(g_rssi_cache[replace_idx].mac, mac, 6);
+  g_rssi_cache[replace_idx].rssi_dbm = rssi_dbm;
+  g_rssi_cache[replace_idx].seen_ms = now;
+  portEXIT_CRITICAL(&g_rssi_mux);
+}
+
+int8_t rssi_cache_lookup(const uint8_t* mac) {
+  if (mac == nullptr) {
+    return -127;
+  }
+  const uint32_t now = millis();
+  portENTER_CRITICAL(&g_rssi_mux);
+  for (const auto& slot : g_rssi_cache) {
+    if (slot.seen_ms != 0 && mac_equal(slot.mac, mac) && (now - slot.seen_ms) <= kRssiCacheTtlMs) {
+      const int8_t rssi = slot.rssi_dbm;
+      portEXIT_CRITICAL(&g_rssi_mux);
+      return rssi;
+    }
+  }
+  portEXIT_CRITICAL(&g_rssi_mux);
+  return -127;
+}
+
+void promiscuous_rx_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
+  if (buf == nullptr) {
+    return;
+  }
+  if (type != WIFI_PKT_MGMT && type != WIFI_PKT_DATA) {
+    return;
+  }
+  auto* pkt = static_cast<wifi_promiscuous_pkt_t*>(buf);
+  const uint16_t sig_len = pkt->rx_ctrl.sig_len;
+  if (sig_len < 16 || sig_len > 250) {
+    return;
+  }
+  const uint8_t* src = pkt->payload + 10;
+  rssi_cache_store(src, static_cast<int8_t>(pkt->rx_ctrl.rssi));
+}
+
+bool rssi_promiscuous_begin() {
+  if (esp_wifi_set_promiscuous(false) != ESP_OK) {
+    return false;
+  }
+  if (esp_wifi_set_promiscuous_rx_cb(&promiscuous_rx_cb) != ESP_OK) {
+    return false;
+  }
+  return esp_wifi_set_promiscuous(true) == ESP_OK;
+}
+
+int8_t resolve_rx_rssi_dbm(const uint8_t* mac, int8_t callback_rssi_dbm) {
+  if (rssi_dbm_valid(callback_rssi_dbm)) {
+    return callback_rssi_dbm;
+  }
+  const int8_t cached = rssi_cache_lookup(mac);
+  if (rssi_dbm_valid(cached)) {
+    return cached;
+  }
+  return -127;
+}
 
 bool rx_queue_push(const RxItem& item) {
   portENTER_CRITICAL(&g_rx_mux);
@@ -108,6 +270,11 @@ bool send_ack_v2(const ReportFrameV2& frame, const uint8_t* dst_mac) {
   ack.ack_seq = frame.seq;
   memset(ack.device_id, 0, sizeof(ack.device_id));
   strncpy(ack.device_id, frame.device_id, sizeof(ack.device_id) - 1);
+  const time_t now = time(nullptr);
+  ack.gateway_unix_ts =
+      now > static_cast<time_t>(kMinValidUnixTs) ? static_cast<uint32_t>(now) : 0U;
+  ack.proto_version = kBeeplanProtoAckV3;
+  ack.wake_interval_sec = wake_interval_for_public_id(frame.device_id);
   return esp_now_send(dst_mac, reinterpret_cast<uint8_t*>(&ack), sizeof(ack)) == ESP_OK;
 }
 
@@ -136,7 +303,7 @@ void handle_v1(const uint8_t* data, int len) {
   }
 }
 
-void handle_v2(const uint8_t* mac, const uint8_t* data, int len) {
+void handle_v2(const uint8_t* mac, const uint8_t* data, int len, int8_t rx_rssi_dbm = -127) {
   if (len != static_cast<int>(sizeof(ReportFrameV2))) {
     return;
   }
@@ -151,9 +318,11 @@ void handle_v2(const uint8_t* mac, const uint8_t* data, int len) {
   RxItem item{};
   item.kind = RxKind::V2;
   item.v2.frame = tmp;
+  item.v2.rx_rssi_dbm = rx_rssi_dbm;
   memcpy(item.v2.src_mac, mac, 6);
   if (rx_queue_push(item)) {
-    BEE_SERIAL.printf("ESP-NOW v2 rx id=%s seq=%u\n", tmp.device_id, static_cast<unsigned>(tmp.seq));
+    BEE_SERIAL.printf("ESP-NOW v2 rx id=%s seq=%u rssi=%d\n", tmp.device_id,
+                      static_cast<unsigned>(tmp.seq), static_cast<int>(rx_rssi_dbm));
   }
 }
 
@@ -164,7 +333,8 @@ void on_recv_legacy(const uint8_t* mac, const uint8_t* data, int len) {
   uint32_t magic = 0;
   memcpy(&magic, data, sizeof(magic));
   if (magic == kBeeplanMagicV2) {
-    handle_v2(mac, data, len);
+    const int8_t rx_rssi = resolve_rx_rssi_dbm(mac, -127);
+    handle_v2(mac, data, len, rx_rssi);
     return;
   }
   handle_v1(data, len);
@@ -174,6 +344,19 @@ void on_recv_legacy(const uint8_t* mac, const uint8_t* data, int len) {
 void on_recv_v3(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
   const uint8_t* mac = info ? info->src_addr : nullptr;
   uint8_t zero[6] = {};
+  int8_t callback_rssi = -127;
+  if (info != nullptr && info->rx_ctrl != nullptr) {
+    callback_rssi = info->rx_ctrl->rssi;
+  }
+  if (len >= 4) {
+    uint32_t magic = 0;
+    memcpy(&magic, data, sizeof(magic));
+    if (magic == kBeeplanMagicV2) {
+      const int8_t rx_rssi = resolve_rx_rssi_dbm(mac ? mac : zero, callback_rssi);
+      handle_v2(mac ? mac : zero, data, len, rx_rssi);
+      return;
+    }
+  }
   on_recv_legacy(mac ? mac : zero, data, len);
 }
 #endif
@@ -217,16 +400,106 @@ String decode_firmware_version(uint16_t major_minor, uint16_t patch) {
   return String(buf);
 }
 
-float gateway_battery_demo_percent() {
-  static float pct = 91.0f;
-  pct += static_cast<float>(random(-8, 9)) / 10.0f;
-  if (pct < 10.0f) {
-    pct = 98.0f;
+/** battery_x100 ≤ 500 — напряжение (V×100); иначе legacy-процент×100. */
+float decode_battery_volts(int16_t battery_x100) {
+  if (battery_x100 <= 0) {
+    return 0.0f;
   }
+  if (battery_x100 <= 500) {
+    return battery_x100 / 100.0f;
+  }
+  float pct = battery_x100 / 100.0f;
   if (pct > 100.0f) {
     pct = 100.0f;
   }
-  return pct;
+  return 3.30f + (pct / 100.0f) * 0.90f;
+}
+
+int8_t gateway_wifi_rssi_dbm() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return -127;
+  }
+  int8_t rssi = static_cast<int8_t>(WiFi.RSSI());
+  if (rssi >= 0) {
+    return -127;
+  }
+  if (rssi < -120) {
+    return -120;
+  }
+  return rssi;
+}
+
+#if defined(BEEPLAN_GATEWAY_BATTERY_ADC_PIN) && (BEEPLAN_GATEWAY_BATTERY_ADC_PIN >= 0)
+constexpr int kGwBatAdcPin = BEEPLAN_GATEWAY_BATTERY_ADC_PIN;
+constexpr int kGwBatSampleCount = 8;
+/** Делитель 100k/100k (как на T-Energy). */
+constexpr float kGwBatDividerRatio = 2.0f;
+bool g_gw_bat_adc_ready = false;
+
+void gateway_battery_adc_init() {
+  if (g_gw_bat_adc_ready) {
+    return;
+  }
+  analogSetPinAttenuation(kGwBatAdcPin, ADC_11db);
+  pinMode(kGwBatAdcPin, INPUT);
+  g_gw_bat_adc_ready = true;
+}
+
+bool gateway_battery_volts(float& out) {
+  gateway_battery_adc_init();
+  uint32_t sum_mv = 0;
+  for (int i = 0; i < kGwBatSampleCount; ++i) {
+    sum_mv += static_cast<uint32_t>(analogReadMilliVolts(kGwBatAdcPin));
+    delay(1);
+  }
+  out = static_cast<float>(sum_mv) / static_cast<float>(kGwBatSampleCount) / 1000.0f;
+  out *= kGwBatDividerRatio;
+  if (out < 2.8f || out > 4.35f) {
+    return false;
+  }
+  out = roundf(out * 100.0f) / 100.0f;
+  return true;
+}
+#else
+bool gateway_battery_volts(float& out) {
+  (void)out;
+  return false;
+}
+#endif
+
+bool fill_gateway_batch_status(JsonObject gw) {
+  bool any = false;
+  const int8_t rssi = gateway_wifi_rssi_dbm();
+  if (rssi_dbm_valid(rssi)) {
+    gw["signal_dbm"] = rssi;
+    any = true;
+  }
+  float volts = 0.0f;
+  if (gateway_battery_volts(volts)) {
+    gw["battery_volts"] = volts;
+    any = true;
+  }
+  return any;
+}
+
+void append_gateway_batch_status(JsonDocument& batch) {
+  JsonObject gw = batch["gateway"].to<JsonObject>();
+  if (!fill_gateway_batch_status(gw)) {
+    batch.remove("gateway");
+  }
+}
+
+bool append_gateway_batch_to_body(String& body_out) {
+  JsonDocument gw_doc;
+  JsonObject gw = gw_doc.to<JsonObject>();
+  if (!fill_gateway_batch_status(gw)) {
+    return false;
+  }
+  body_out += ",\"gateway\":";
+  String gw_frag;
+  serializeJson(gw, gw_frag);
+  body_out += gw_frag;
+  return true;
 }
 
 bool spool_init() {
@@ -260,10 +533,112 @@ void spool_recount() {
   f.close();
 }
 
+size_t littlefs_free_bytes() {
+  return LittleFS.totalBytes() - LittleFS.usedBytes();
+}
+
+size_t spool_file_bytes() {
+  if (!LittleFS.exists(kSpoolPath)) {
+    return 0;
+  }
+  File f = LittleFS.open(kSpoolPath, "r");
+  if (!f) {
+    return 0;
+  }
+  const size_t sz = f.size();
+  f.close();
+  return sz;
+}
+
+bool spool_has_compact_space() {
+  return littlefs_free_bytes() > spool_file_bytes() + kSpoolCompactReserveBytes;
+}
+
+void spool_clear_all(const char* reason) {
+  BEE_SERIAL.printf("WARN: spool cleared (%s), was %u lines\n", reason,
+                    static_cast<unsigned>(g_spool_pending_count));
+  LittleFS.remove(kSpoolPath);
+  LittleFS.remove(kSpoolTmpPath);
+  spool_init();
+  g_spool_pending_count = 0;
+}
+
+bool spool_drop_head_lines(size_t lines_to_drop) {
+  if (lines_to_drop == 0 || !LittleFS.exists(kSpoolPath)) {
+    return true;
+  }
+  if (!spool_has_compact_space()) {
+    spool_clear_all("LittleFS full");
+    return true;
+  }
+
+  File in = LittleFS.open(kSpoolPath, "r");
+  if (!in) {
+    return false;
+  }
+  File out = LittleFS.open(kSpoolTmpPath, "w");
+  if (!out) {
+    in.close();
+    spool_clear_all("spool tmp open failed");
+    return true;
+  }
+
+  size_t dropped = 0;
+  while (in.available()) {
+    String line = in.readStringUntil('\n');
+    line.trim();
+    if (line.length() < 3) {
+      continue;
+    }
+    if (dropped < lines_to_drop) {
+      ++dropped;
+      continue;
+    }
+    out.println(line);
+  }
+  in.close();
+  out.flush();
+  out.close();
+
+  if (dropped == 0) {
+    LittleFS.remove(kSpoolTmpPath);
+    return false;
+  }
+
+  LittleFS.remove(kSpoolPath);
+  if (!LittleFS.rename(kSpoolTmpPath, kSpoolPath)) {
+    spool_clear_all("spool rename failed");
+    return false;
+  }
+  spool_recount();
+  return true;
+}
+
+void spool_trim_if_needed() {
+  if (g_spool_pending_count <= kSpoolSoftMaxLines && littlefs_free_bytes() > kSpoolCompactReserveBytes) {
+    return;
+  }
+  const size_t drop = g_spool_pending_count > 0 ? g_spool_pending_count / 2 : 0;
+  if (drop == 0 || !spool_drop_head_lines(drop)) {
+    spool_clear_all("spool pressure");
+  } else {
+    BEE_SERIAL.printf("WARN: spool trimmed to %u lines (free=%u B)\n",
+                      static_cast<unsigned>(g_spool_pending_count),
+                      static_cast<unsigned>(littlefs_free_bytes()));
+  }
+}
+
 bool spool_append_line(const String& line) {
+  if (g_spool_pending_count >= kSpoolSoftMaxLines || littlefs_free_bytes() < kSpoolCompactReserveBytes) {
+    spool_trim_if_needed();
+  }
   File f = LittleFS.open(kSpoolPath, "a");
   if (!f) {
-    return false;
+    spool_trim_if_needed();
+    f = LittleFS.open(kSpoolPath, "a");
+    if (!f) {
+      return false;
+    }
   }
   f.println(line);
   f.flush();
@@ -287,16 +662,24 @@ bool post_heartbeat() {
   doc["firmware_version"] = FIRMWARE_VERSION;
   doc["wifi_channel"] = WiFi.channel();
   doc["spool_pending_count"] = g_spool_pending_count;
-  if (WiFi.status() == WL_CONNECTED) {
-    doc["signal_dbm"] = WiFi.RSSI();
+  const int8_t rssi = gateway_wifi_rssi_dbm();
+  if (rssi_dbm_valid(rssi)) {
+    doc["signal_dbm"] = rssi;
   }
-  doc["battery_percent"] = gateway_battery_demo_percent();
   String body;
   serializeJson(doc, body);
 
   const int code = http.POST(body);
-  BEE_SERIAL.printf("POST /v1/concentrators/heartbeat -> %d spool=%u ch=%d\n", code,
-                    static_cast<unsigned>(g_spool_pending_count), WiFi.channel());
+  BEEPLAN_LOG("POST /v1/concentrators/heartbeat -> %d spool=%u ch=%d\n", code,
+              static_cast<unsigned>(g_spool_pending_count), WiFi.channel());
+  if (code >= 200 && code < 300) {
+    JsonDocument resp;
+    const String resp_body = http.getString();
+    if (deserializeJson(resp, resp_body) == DeserializationError::Ok) {
+      load_edge_wake_configs(resp);
+      BEEPLAN_LOG("heartbeat edge configs=%u\n", static_cast<unsigned>(g_edge_wake_count));
+    }
+  }
   http.end();
   return code >= 200 && code < 300;
 }
@@ -347,12 +730,13 @@ bool post_batch_body(const String& body, size_t sample_count, JsonArray& accepte
 
 bool post_batch(JsonDocument& batchRoot, JsonArray& accepted_ids) {
   if (!batchRoot["samples"].is<JsonArray>()) {
-    return true;
+    batchRoot["samples"].to<JsonArray>();
   }
   JsonArray samples = batchRoot["samples"].as<JsonArray>();
   if (samples.size() == 0) {
     return true;
   }
+  append_gateway_batch_status(batchRoot);
   String body;
   serializeJson(batchRoot, body);
   return post_batch_body(body, samples.size(), accepted_ids);
@@ -380,8 +764,8 @@ void append_v1_sample(JsonArray& samples, const EnvelopeV1& e) {
       s["value"]["dbm"] = e.i16_a;
       break;
     case 4:
-      s["metric"] = "battery_percent";
-      s["value"]["percent"] = e.i16_a / 100.0f;
+      s["metric"] = "battery_voltage";
+      s["value"]["volts"] = decode_battery_volts(e.i16_a);
       break;
     case 5:
       s["metric"] = "firmware_version";
@@ -421,7 +805,8 @@ String make_report_id(const ReportFrameV2& frame) {
   return String(buf);
 }
 
-void append_v2_samples(JsonArray& samples, const ReportFrameV2& frame, const String& report_id) {
+void append_v2_samples(JsonArray& samples, const ReportFrameV2& frame, const String& report_id,
+                       int8_t rx_rssi_dbm = -127) {
   time_t ts = static_cast<time_t>(frame.unix_ts);
   if (ts < static_cast<time_t>(kMinValidUnixTs)) {
     ts = time(nullptr);
@@ -451,15 +836,19 @@ void append_v2_samples(JsonArray& samples, const ReportFrameV2& frame, const Str
     s["metric"] = "signal_level";
     s["ts"] = iso;
     s["report_id"] = report_id;
-    s["value"]["dbm"] = frame.signal_dbm;
+    const int signal_dbm =
+        rssi_dbm_valid(rx_rssi_dbm) ? rx_rssi_dbm
+                                    : (rssi_dbm_valid(static_cast<int8_t>(frame.signal_dbm)) ? frame.signal_dbm
+                                                                                             : rx_rssi_dbm);
+    s["value"]["dbm"] = signal_dbm;
   }
   if (frame.metrics_present & kMetricBattery) {
     JsonObject s = samples.add<JsonObject>();
     s["device_public_id"] = device_id;
-    s["metric"] = "battery_percent";
+    s["metric"] = "battery_voltage";
     s["ts"] = iso;
     s["report_id"] = report_id;
-    s["value"]["percent"] = frame.battery_x100 / 100.0f;
+    s["value"]["volts"] = decode_battery_volts(frame.battery_x100);
   }
   if (frame.metrics_present & kMetricFirmware) {
     JsonObject s = samples.add<JsonObject>();
@@ -471,18 +860,18 @@ void append_v2_samples(JsonArray& samples, const ReportFrameV2& frame, const Str
   }
 }
 
-String build_spool_line(const ReportFrameV2& frame) {
+String build_spool_line(const ReportFrameV2& frame, int8_t rx_rssi_dbm = -127) {
   JsonDocument doc;
   doc["report_id"] = make_report_id(frame);
   JsonArray samples = doc["samples"].to<JsonArray>();
-  append_v2_samples(samples, frame, doc["report_id"].as<const char*>());
+  append_v2_samples(samples, frame, doc["report_id"].as<const char*>(), rx_rssi_dbm);
   String line;
   serializeJson(doc, line);
   return line;
 }
 
 void process_v2_item(const RxV2Item& item) {
-  const String spool_line = build_spool_line(item.frame);
+  const String spool_line = build_spool_line(item.frame, item.rx_rssi_dbm);
   if (!spool_append_line(spool_line)) {
     BEE_SERIAL.println("WARN: spool append failed");
   }
@@ -495,88 +884,13 @@ void flush_ram_queue(JsonDocument& batch) {
     if (item.kind == RxKind::V1) {
       append_v1_sample(samples, item.v1.envelope);
     } else {
-      append_v2_samples(samples, item.v2.frame, make_report_id(item.v2.frame));
+      append_v2_samples(samples, item.v2.frame, make_report_id(item.v2.frame), item.v2.rx_rssi_dbm);
     }
   }
-}
-
-bool remove_accepted_from_spool(const JsonArray& accepted_ids) {
-  if (!LittleFS.exists(kSpoolPath)) {
-    return true;
-  }
-  File in = LittleFS.open(kSpoolPath, "r");
-  if (!in) {
-    return false;
-  }
-  File out = LittleFS.open("/beeplan_spool.tmp", "w");
-  if (!out) {
-    in.close();
-    return false;
-  }
-
-  while (in.available()) {
-    String line = in.readStringUntil('\n');
-    line.trim();
-    if (line.length() < 3) {
-      continue;
-    }
-    JsonDocument doc;
-    if (deserializeJson(doc, line) != DeserializationError::Ok) {
-      out.println(line);
-      continue;
-    }
-    const char* rid = doc["report_id"] | "";
-    bool drop = false;
-    for (JsonVariant v : accepted_ids) {
-      if (v.as<String>() == rid) {
-        drop = true;
-        break;
-      }
-    }
-    if (!drop) {
-      out.println(line);
-    }
-  }
-  in.close();
-  out.close();
-  LittleFS.remove(kSpoolPath);
-  LittleFS.rename("/beeplan_spool.tmp", kSpoolPath);
-  spool_recount();
-  return true;
 }
 
 bool drop_first_spool_line() {
-  if (!LittleFS.exists(kSpoolPath)) {
-    return false;
-  }
-  File in = LittleFS.open(kSpoolPath, "r");
-  if (!in) {
-    return false;
-  }
-  File out = LittleFS.open("/beeplan_spool.tmp", "w");
-  if (!out) {
-    in.close();
-    return false;
-  }
-
-  bool skipped = false;
-  while (in.available()) {
-    String line = in.readStringUntil('\n');
-    line.trim();
-    if (!skipped && line.length() >= 3) {
-      skipped = true;
-      continue;
-    }
-    if (line.length() >= 3) {
-      out.println(line);
-    }
-  }
-  in.close();
-  out.close();
-  LittleFS.remove(kSpoolPath);
-  LittleFS.rename("/beeplan_spool.tmp", kSpoolPath);
-  spool_recount();
-  return skipped;
+  return spool_drop_head_lines(1);
 }
 
 bool read_first_spool_line(String& line_out) {
@@ -640,13 +954,23 @@ bool build_uplink_body(String& body_out, JsonArray& report_ids_out, JsonDocument
 
   drop_corrupt_spool_head();
   if (!LittleFS.exists(kSpoolPath)) {
-    body_out += "]}";
-    return sample_count_out > 0;
+    if (sample_count_out == 0) {
+      return false;
+    }
+    body_out += ']';
+    append_gateway_batch_to_body(body_out);
+    body_out += '}';
+    return true;
   }
   File f = LittleFS.open(kSpoolPath, "r");
   if (!f) {
-    body_out += "]}";
-    return sample_count_out > 0;
+    if (sample_count_out == 0) {
+      return false;
+    }
+    body_out += ']';
+    append_gateway_batch_to_body(body_out);
+    body_out += '}';
+    return true;
   }
 
   while (f.available() && spool_lines_out < kMaxSpoolLinesPerBatch &&
@@ -688,8 +1012,13 @@ bool build_uplink_body(String& body_out, JsonArray& report_ids_out, JsonDocument
     ++spool_lines_out;
   }
   f.close();
-  body_out += "]}";
-  return sample_count_out > 0;
+  if (sample_count_out == 0) {
+    return false;
+  }
+  body_out += ']';
+  append_gateway_batch_to_body(body_out);
+  body_out += '}';
+  return true;
 }
 
 void try_uplink() {
@@ -707,10 +1036,6 @@ void try_uplink() {
   size_t spool_lines = 0;
   size_t sample_count = 0;
   if (!build_uplink_body(body, pending_report_ids, ram_batch, spool_lines, sample_count)) {
-    if (g_spool_pending_count > 0) {
-      BEE_SERIAL.printf("WARN: spool=%u but batch empty\n",
-                        static_cast<unsigned>(g_spool_pending_count));
-    }
     g_drain_backoff_ms = kDrainIntervalMs;
     return;
   }
@@ -722,15 +1047,16 @@ void try_uplink() {
     return;
   }
 
-  if (accepted_ids.size() > 0) {
-    remove_accepted_from_spool(accepted_ids);
-  } else if (pending_report_ids.size() > 0) {
-    remove_accepted_from_spool(pending_report_ids);
+  if (spool_lines > 0) {
+    if (!spool_drop_head_lines(spool_lines)) {
+      BEE_SERIAL.println("WARN: spool_drop_head failed");
+    }
   }
 
-  BEE_SERIAL.printf("drain ok: spool_lines=%u samples=%u pending=%u\n",
+  BEE_SERIAL.printf("drain ok: spool_lines=%u samples=%u pending=%u free=%u B\n",
                     static_cast<unsigned>(spool_lines), static_cast<unsigned>(sample_count),
-                    static_cast<unsigned>(g_spool_pending_count));
+                    static_cast<unsigned>(g_spool_pending_count),
+                    static_cast<unsigned>(littlefs_free_bytes()));
   g_drain_backoff_ms = kDrainIntervalMs;
 }
 
@@ -757,6 +1083,9 @@ void setup() {
 
   spool_init();
   spool_recount();
+  if (g_spool_pending_count > kSpoolSoftMaxLines || !spool_has_compact_space()) {
+    spool_trim_if_needed();
+  }
 
   if (esp_now_init() != ESP_OK) {
     BEE_SERIAL.println("esp_now_init failed — halted");
@@ -782,6 +1111,11 @@ void setup() {
     }
   }
 #endif
+  if (rssi_promiscuous_begin()) {
+    BEE_SERIAL.println("RSSI promiscuous mode on");
+  } else {
+    BEE_SERIAL.println("WARN: RSSI promiscuous mode failed");
+  }
 
   randomSeed(esp_random());
   sync_time_utc();

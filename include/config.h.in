@@ -14,3 +14,6 @@
 
 /** Полное имя в Serial: beeplan-Gateway-0.1.2 */
 #define FIRMWARE_SERIAL_TAG "{{FIRMWARE_SERIAL_TAG}}"
+
+/** 1 — подробный UART-лог; 0 — без задержки serial при boot. */
+#define BEEPLAN_DEBUG {{BEEPLAN_DEBUG}}

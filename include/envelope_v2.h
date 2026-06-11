@@ -9,6 +9,8 @@ constexpr uint8_t kBeeplanProtoV1 = 1;
 /** ESP-NOW v2 — aggregated hourly report. */
 constexpr uint32_t kBeeplanMagicV2 = 0x00BEEF02;
 constexpr uint8_t kBeeplanProtoV2 = 2;
+/** ACK v3 — downlink с wake_interval_sec. */
+constexpr uint8_t kBeeplanProtoAckV3 = 3;
 
 /** Downlink ACK (gateway → edge). */
 constexpr uint32_t kBeeplanMagicAck = 0x00BEEFAC;
@@ -26,6 +28,8 @@ constexpr uint8_t kMetricAudio = 0x20;
 
 /** Минимальный валидный unix_ts (~2023-11). Ниже — в поле несёт NVS-счётчик edge. */
 constexpr uint32_t kMinValidUnixTs = 1700000000U;
+/** TDMA-слот (telemetry_slot_sec) применяется только при wake_interval ≥ этого значения. */
+constexpr uint32_t kTdmaMinWakeIntervalSec = 600U;
 
 struct __attribute__((packed)) EnvelopeV1 {
   uint32_t magic;
@@ -49,6 +53,7 @@ struct __attribute__((packed)) ReportFrameV2 {
   int16_t temp_c_x100;
   int16_t rh_x100;
   int16_t signal_dbm;
+  /** Напряжение батареи × 100 (3.85 V → 385). */
   int16_t battery_x100;
   uint16_t fw_major_minor;
   uint16_t fw_patch;
@@ -61,6 +66,13 @@ struct __attribute__((packed)) AckFrameV2 {
   uint8_t proto_version;
   uint8_t ack_seq;
   char device_id[32];
+  /** Время шлюза (UTC unix); 0 — часы на gateway ещё не синхронизированы. */
+  uint32_t gateway_unix_ts;
+  /** Интервал замера (с); 0 — не менять. Поле читается при proto_version ≥ 3. */
+  uint16_t wake_interval_sec;
 };
 
+constexpr size_t kAckFrameV2LegacyLen = 42;
+
 static_assert(sizeof(ReportFrameV2) <= 64, "ReportFrameV2 must stay compact");
+static_assert(sizeof(AckFrameV2) == 44, "AckFrameV2 layout");
