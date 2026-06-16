@@ -1080,6 +1080,11 @@ void setup() {
 
   BEE_SERIAL.println(WiFi.localIP());
   BEE_SERIAL.printf("WiFi channel=%d (ESP-NOW uses this channel)\n", WiFi.channel());
+  if (beeplan_espnow_enable_lr()) {
+    BEE_SERIAL.println("ESP-NOW LR mode enabled");
+  } else {
+    BEE_SERIAL.println("WARN: ESP-NOW LR mode not enabled");
+  }
 
   spool_init();
   spool_recount();
