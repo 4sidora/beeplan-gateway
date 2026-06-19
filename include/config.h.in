@@ -1,7 +1,18 @@
 #pragma once
 
+/** 0 = Wi‑Fi, 1 = сотовая связь (SIM800 на TTGO T-Call). */
+#define UPLINK_MODE {{UPLINK_MODE}}
+
 #define WIFI_SSID "{{WIFI_SSID}}"
 #define WIFI_PASSWORD "{{WIFI_PASSWORD}}"
+
+/** Канал Wi‑Fi для ESP-NOW (1–13); при cellular — без подключения к AP. */
+#define GATEWAY_WIFI_CHANNEL {{GATEWAY_WIFI_CHANNEL}}
+
+/** APN оператора (cellular). */
+#define CELLULAR_APN "{{CELLULAR_APN}}"
+#define CELLULAR_USER "{{CELLULAR_USER}}"
+#define CELLULAR_PASS "{{CELLULAR_PASS}}"
 
 /** Базовый URL API без завершающего слэша. */
 #define API_BASE_URL "{{API_BASE_URL}}"

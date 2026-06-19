@@ -16,6 +16,7 @@
 
 #include "beeplan_io.h"
 #include "beeplan_espnow.h"
+#include "beeplan_uplink.h"
 #include "config.h"
 #include "envelope_v2.h"
 
@@ -362,15 +363,7 @@ void on_recv_v3(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
 #endif
 
 bool wifi_connect() {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  for (int i = 0; i < 60; ++i) {
-    if (WiFi.status() == WL_CONNECTED) {
-      return true;
-    }
-    delay(500);
-  }
-  return false;
+  return uplink_init();
 }
 
 void sync_time_utc() {
@@ -416,17 +409,7 @@ float decode_battery_volts(int16_t battery_x100) {
 }
 
 int8_t gateway_wifi_rssi_dbm() {
-  if (WiFi.status() != WL_CONNECTED) {
-    return -127;
-  }
-  int8_t rssi = static_cast<int8_t>(WiFi.RSSI());
-  if (rssi >= 0) {
-    return -127;
-  }
-  if (rssi < -120) {
-    return -120;
-  }
-  return rssi;
+  return uplink_signal_dbm();
 }
 
 #if defined(BEEPLAN_GATEWAY_BATTERY_ADC_PIN) && (BEEPLAN_GATEWAY_BATTERY_ADC_PIN >= 0)
@@ -657,10 +640,12 @@ String format_gateway_mac() {
 }
 
 bool post_heartbeat() {
-  WiFiClient client;
+  if (!uplink_ready()) {
+    return false;
+  }
   HTTPClient http;
   String url = String(API_BASE_URL) + "/v1/concentrators/heartbeat";
-  if (!http.begin(client, url)) {
+  if (!http.begin(uplink_http_client(), url)) {
     return false;
   }
   http.addHeader("Content-Type", "application/json");
@@ -669,7 +654,7 @@ bool post_heartbeat() {
   JsonDocument doc;
   doc["mac"] = format_gateway_mac();
   doc["firmware_version"] = FIRMWARE_VERSION;
-  doc["wifi_channel"] = WiFi.channel();
+  doc["wifi_channel"] = gateway_wifi_channel();
   doc["spool_pending_count"] = g_spool_pending_count;
   const int8_t rssi = gateway_wifi_rssi_dbm();
   if (rssi_dbm_valid(rssi)) {
@@ -680,7 +665,7 @@ bool post_heartbeat() {
 
   const int code = http.POST(body);
   BEEPLAN_LOG("POST /v1/concentrators/heartbeat -> %d spool=%u ch=%d\n", code,
-              static_cast<unsigned>(g_spool_pending_count), WiFi.channel());
+              static_cast<unsigned>(g_spool_pending_count), gateway_wifi_channel());
   if (code >= 200 && code < 300) {
     JsonDocument resp;
     const String resp_body = http.getString();
@@ -707,10 +692,12 @@ bool post_batch_body(const String& body, size_t sample_count, JsonArray& accepte
   if (sample_count == 0) {
     return true;
   }
-  WiFiClient client;
+  if (!uplink_ready()) {
+    return false;
+  }
   HTTPClient http;
   String url = String(API_BASE_URL) + "/v1/telemetry/batch";
-  if (!http.begin(client, url)) {
+  if (!http.begin(uplink_http_client(), url)) {
     return false;
   }
   http.addHeader("Content-Type", "application/json");
@@ -752,9 +739,12 @@ bool post_batch(JsonDocument& batchRoot, JsonArray& accepted_ids) {
 }
 
 void append_v1_sample(JsonArray& samples, const EnvelopeV1& e) {
-  time_t ts = static_cast<time_t>(e.unix_ts);
-  if (ts < 1700000000) {
-    ts = time(nullptr);
+  time_t ts = time(nullptr);
+  if (ts < static_cast<time_t>(kMinValidUnixTs)) {
+    ts = static_cast<time_t>(e.unix_ts);
+    if (ts < 1700000000) {
+      ts = time(nullptr);
+    }
   }
   JsonObject s = samples.add<JsonObject>();
   s["device_public_id"] = String(e.device_id);
@@ -816,9 +806,12 @@ String make_report_id(const ReportFrameV2& frame) {
 
 void append_v2_samples(JsonArray& samples, const ReportFrameV2& frame, const String& report_id,
                        int8_t rx_rssi_dbm = -127) {
-  time_t ts = static_cast<time_t>(frame.unix_ts);
+  time_t ts = time(nullptr);
   if (ts < static_cast<time_t>(kMinValidUnixTs)) {
-    ts = time(nullptr);
+    ts = static_cast<time_t>(frame.unix_ts);
+    if (ts < static_cast<time_t>(kMinValidUnixTs)) {
+      ts = time(nullptr);
+    }
   }
   const String iso = format_iso_utc(ts);
   const String device_id = String(frame.device_id);
@@ -1031,7 +1024,7 @@ bool build_uplink_body(String& body_out, JsonArray& report_ids_out, JsonDocument
 }
 
 void try_uplink() {
-  if (WiFi.status() != WL_CONNECTED) {
+  if (!uplink_ready()) {
     return;
   }
 
@@ -1082,13 +1075,12 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
 
-  if (!wifi_connect()) {
-    BEE_SERIAL.println("WiFi failed — reboot after fixing credentials");
+  if (!uplink_init()) {
+    BEE_SERIAL.println("Uplink failed — reboot after fixing credentials / SIM");
     return;
   }
 
-  BEE_SERIAL.println(WiFi.localIP());
-  BEE_SERIAL.printf("WiFi channel=%d (ESP-NOW uses this channel)\n", WiFi.channel());
+  BEE_SERIAL.printf("ESP-NOW channel=%d\n", gateway_wifi_channel());
   if (beeplan_espnow_enable_lr()) {
     BEE_SERIAL.println("ESP-NOW LR mode enabled");
   } else {
@@ -1149,7 +1141,7 @@ void loop() {
       append_v1_sample(samples, item.v1.envelope);
       JsonDocument accepted;
       JsonArray accepted_ids = accepted.to<JsonArray>();
-      if (WiFi.status() == WL_CONNECTED) {
+      if (uplink_ready()) {
         post_batch(batch, accepted_ids);
       }
     }

@@ -28,8 +28,6 @@ constexpr uint8_t kMetricAudio = 0x20;
 
 /** Минимальный валидный unix_ts (~2023-11). Ниже — в поле несёт NVS-счётчик edge. */
 constexpr uint32_t kMinValidUnixTs = 1700000000U;
-/** TDMA-слот (telemetry_slot_sec) применяется только при wake_interval ≥ этого значения. */
-constexpr uint32_t kTdmaMinWakeIntervalSec = 600U;
 
 struct __attribute__((packed)) EnvelopeV1 {
   uint32_t magic;
