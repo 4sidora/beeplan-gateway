@@ -643,14 +643,7 @@ bool post_heartbeat() {
   if (!uplink_ready()) {
     return false;
   }
-  HTTPClient http;
   String url = String(API_BASE_URL) + "/v1/concentrators/heartbeat";
-  if (!http.begin(uplink_http_client(), url)) {
-    return false;
-  }
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("Authorization", String("Bearer ") + INGEST_TOKEN);
-
   JsonDocument doc;
   doc["mac"] = format_gateway_mac();
   doc["firmware_version"] = FIRMWARE_VERSION;
@@ -663,19 +656,20 @@ bool post_heartbeat() {
   String body;
   serializeJson(doc, body);
 
-  const int code = http.POST(body);
+  int code = 0;
+  String resp_body;
+  const String auth = String("Bearer ") + INGEST_TOKEN;
+  const bool ok = uplink_http_post(url, auth, body, code, resp_body);
   BEEPLAN_LOG("POST /v1/concentrators/heartbeat -> %d spool=%u ch=%d\n", code,
               static_cast<unsigned>(g_spool_pending_count), gateway_wifi_channel());
-  if (code >= 200 && code < 300) {
+  if (ok) {
     JsonDocument resp;
-    const String resp_body = http.getString();
     if (deserializeJson(resp, resp_body) == DeserializationError::Ok) {
       load_edge_wake_configs(resp);
       BEEPLAN_LOG("heartbeat edge configs=%u\n", static_cast<unsigned>(g_edge_wake_count));
     }
   }
-  http.end();
-  return code >= 200 && code < 300;
+  return ok;
 }
 
 void send_heartbeat_with_retry() {
@@ -695,26 +689,22 @@ bool post_batch_body(const String& body, size_t sample_count, JsonArray& accepte
   if (!uplink_ready()) {
     return false;
   }
-  HTTPClient http;
   String url = String(API_BASE_URL) + "/v1/telemetry/batch";
-  if (!http.begin(uplink_http_client(), url)) {
+  const String auth = String("Bearer ") + INGEST_TOKEN;
+  int code = 0;
+  String resp_body;
+  if (!uplink_http_post(url, auth, body, code, resp_body)) {
+    BEE_SERIAL.printf("POST /v1/telemetry/batch -> %d samples=%u\n", code,
+                      static_cast<unsigned>(sample_count));
+    if (resp_body.length() > 0) {
+      BEE_SERIAL.println(resp_body);
+    }
     return false;
   }
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("Authorization", String("Bearer ") + INGEST_TOKEN);
 
-  const int code = http.POST(body);
   BEE_SERIAL.printf("POST /v1/telemetry/batch -> %d samples=%u\n", code,
                     static_cast<unsigned>(sample_count));
-  if (code < 200 || code >= 300) {
-    BEE_SERIAL.println(http.getString());
-    http.end();
-    return false;
-  }
-
   JsonDocument resp;
-  const String resp_body = http.getString();
-  http.end();
   if (deserializeJson(resp, resp_body) == DeserializationError::Ok &&
       resp["accepted_report_ids"].is<JsonArray>()) {
     for (JsonVariant v : resp["accepted_report_ids"].as<JsonArray>()) {

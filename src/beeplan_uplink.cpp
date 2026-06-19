@@ -1,5 +1,6 @@
 #include "beeplan_uplink.h"
 
+#include <HTTPClient.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
 
@@ -15,7 +16,41 @@
 
 namespace {
 
-WiFiClient g_wifi_client;
+struct ParsedUrl {
+  bool https = false;
+  String host;
+  uint16_t port = 80;
+  String path = "/";
+};
+
+bool parse_url(const String& url, ParsedUrl& out) {
+  String rest = url;
+  if (rest.startsWith("https://")) {
+    out.https = true;
+    out.port = 443;
+    rest = rest.substring(8);
+  } else if (rest.startsWith("http://")) {
+    rest = rest.substring(7);
+  } else {
+    return false;
+  }
+
+  const int slash = rest.indexOf('/');
+  String host_port = slash >= 0 ? rest.substring(0, slash) : rest;
+  out.path = slash >= 0 ? rest.substring(slash) : "/";
+  if (out.path.length() == 0) {
+    out.path = "/";
+  }
+
+  const int colon = host_port.indexOf(':');
+  if (colon >= 0) {
+    out.host = host_port.substring(0, colon);
+    out.port = static_cast<uint16_t>(host_port.substring(colon + 1).toInt());
+  } else {
+    out.host = host_port;
+  }
+  return out.host.length() > 0;
+}
 
 #if UPLINK_MODE == UPLINK_MODE_CELLULAR && defined(BEEPLAN_BOARD_TTGO_T_CALL)
 
@@ -36,11 +71,13 @@ WiFiClient g_wifi_client;
 #endif
 
 #define TINY_GSM_MODEM_SIM800
+#define TINY_GSM_USE_SSL
 #include <TinyGsmClient.h>
+#include <HttpClient.h>
 
 HardwareSerial g_modem_serial(1);
 TinyGsm g_modem(g_modem_serial);
-TinyGsmClient g_cell_client(g_modem);
+TinyGsmClientSecure g_cell_secure(g_modem);
 bool g_cellular_ready = false;
 
 void modem_power_on() {
@@ -92,6 +129,27 @@ int8_t csq_to_dbm(int8_t csq) {
   return static_cast<int8_t>(-113 + 2 * csq);
 }
 
+bool cellular_http_post(const ParsedUrl& parsed, const String& authorization_header, const String& body,
+                        int& status_code, String& response_body) {
+  const uint16_t port = parsed.port != 0 ? parsed.port : (parsed.https ? 443 : 80);
+  HttpClient http(g_cell_secure, parsed.host.c_str(), port);
+  http.beginRequest();
+  http.post(parsed.path.c_str());
+  http.sendHeader("Content-Type", "application/json");
+  http.sendHeader("Authorization", authorization_header);
+  http.sendHeader("Connection", "close");
+  http.beginBody();
+  http.print(body);
+  http.endRequest();
+  status_code = http.responseStatusCode();
+  response_body = "";
+  while (http.available()) {
+    response_body += static_cast<char>(http.read());
+  }
+  http.stop();
+  return status_code >= 200 && status_code < 300;
+}
+
 #endif  // cellular
 
 bool wifi_sta_connect() {
@@ -112,6 +170,23 @@ void wifi_espnow_channel_only() {
   WiFi.setSleep(false);
   WiFi.disconnect();
   esp_wifi_set_channel(GATEWAY_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+}
+
+bool wifi_http_post(const String& url, const String& authorization_header, const String& body,
+                    int& status_code, String& response_body) {
+  WiFiClient client;
+  HTTPClient http;
+  if (!http.begin(client, url)) {
+    status_code = 0;
+    response_body = "";
+    return false;
+  }
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", authorization_header);
+  status_code = http.POST(body);
+  response_body = http.getString();
+  http.end();
+  return status_code >= 200 && status_code < 300;
 }
 
 }  // namespace
@@ -145,11 +220,18 @@ bool uplink_ready() {
 #endif
 }
 
-Client& uplink_http_client() {
+bool uplink_http_post(const String& url, const String& authorization_header, const String& body,
+                      int& status_code, String& response_body) {
 #if UPLINK_MODE == UPLINK_MODE_CELLULAR && defined(BEEPLAN_BOARD_TTGO_T_CALL)
-  return g_cell_client;
+  ParsedUrl parsed;
+  if (!parse_url(url, parsed)) {
+    status_code = 0;
+    response_body = "";
+    return false;
+  }
+  return cellular_http_post(parsed, authorization_header, body, status_code, response_body);
 #else
-  return g_wifi_client;
+  return wifi_http_post(url, authorization_header, body, status_code, response_body);
 #endif
 }
 
