@@ -13,6 +13,7 @@
 #include <esp_random.h>
 #include <esp_wifi.h>
 #include <time.h>
+#include <vector>
 
 #include "beeplan_io.h"
 #include "beeplan_espnow.h"
@@ -24,9 +25,26 @@ namespace {
 
 constexpr size_t kRxQueueCap = 512;
 constexpr uint32_t kHeartbeatIntervalMs = 15U * 60U * 1000U;
+#ifndef UPLINK_MODE_WIFI
+#define UPLINK_MODE_WIFI 0
+#endif
+#ifndef UPLINK_MODE_CELLULAR
+#define UPLINK_MODE_CELLULAR 1
+#endif
+#if UPLINK_MODE == UPLINK_MODE_CELLULAR
+constexpr uint32_t kDrainIntervalMs = 10U * 1000U;
+constexpr uint32_t kDrainBackoffMaxMs = 30U * 1000U;
+constexpr uint32_t kCellularBatchTimeoutMs = 180U * 1000U;
+/** Один отчёт edge за POST — маленький body для медленного GPRS. */
+constexpr size_t kMaxSpoolLinesPerBatch = 1;
+constexpr size_t kMaxSamplesPerBatch = 8;
+#else
 constexpr uint32_t kDrainIntervalMs = 30U * 1000U;
+constexpr uint32_t kDrainBackoffMaxMs = 15U * 60U * 1000U;
+constexpr uint32_t kCellularBatchTimeoutMs = 0;
 constexpr size_t kMaxSpoolLinesPerBatch = 32;
 constexpr size_t kMaxSamplesPerBatch = 96;
+#endif
 constexpr char kSpoolPath[] = "/beeplan_spool.jsonl";
 constexpr char kSpoolTmpPath[] = "/beeplan_spool.tmp";
 /** Мягкий лимит строк spool; при превышении — отбрасываем старые. */
@@ -113,7 +131,12 @@ portMUX_TYPE g_rx_mux = portMUX_INITIALIZER_UNLOCKED;
 uint32_t g_last_heartbeat_ms = 0;
 uint32_t g_last_drain_ms = 0;
 uint32_t g_drain_backoff_ms = kDrainIntervalMs;
+bool g_drain_pending = false;
 uint16_t g_spool_pending_count = 0;
+bool g_spool_fs_ok = false;
+bool g_spool_ram_only = false;
+std::vector<String> g_ram_spool_lines;
+constexpr size_t kRamSpoolMaxLines = 64;
 
 /** ESP-IDF 4.x ESP-NOW recv_cb не отдаёт RSSI — кэш из promiscuous mode. */
 constexpr size_t kRssiCacheSlots = 8;
@@ -367,14 +390,7 @@ bool wifi_connect() {
 }
 
 void sync_time_utc() {
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-  for (int i = 0; i < 100; ++i) {
-    time_t now = time(nullptr);
-    if (now > 1700000000) {
-      return;
-    }
-    delay(200);
-  }
+  uplink_sync_time();
 }
 
 String format_iso_utc(time_t t) {
@@ -485,23 +501,90 @@ bool append_gateway_batch_to_body(String& body_out) {
   return true;
 }
 
-bool spool_init() {
-  if (!LittleFS.begin(true)) {
-    BEE_SERIAL.println("WARN: LittleFS mount failed — spool disabled");
+bool spool_verify_rw() {
+  constexpr char kTestPath[] = "/.beeplan_rw_test";
+  File f = LittleFS.open(kTestPath, "w");
+  if (!f) {
     return false;
   }
-  if (!LittleFS.exists(kSpoolPath)) {
-    File f = LittleFS.open(kSpoolPath, "w");
+  f.print('1');
+  f.close();
+  f = LittleFS.open(kTestPath, "r");
+  if (!f || f.read() != '1') {
     if (f) {
       f.close();
     }
+    LittleFS.remove(kTestPath);
+    return false;
   }
+  f.close();
+  LittleFS.remove(kTestPath);
   return true;
+}
+
+bool spool_create_file() {
+  File f = LittleFS.open(kSpoolPath, "w");
+  if (!f) {
+    return false;
+  }
+  f.close();
+  return true;
+}
+
+bool spool_ensure_mounted() {
+  LittleFS.end();
+  if (LittleFS.begin(true)) {
+    return true;
+  }
+  BEE_SERIAL.println("WARN: LittleFS mount failed");
+  return false;
+}
+
+bool spool_init() {
+  g_spool_fs_ok = false;
+  g_spool_ram_only = false;
+  if (!spool_ensure_mounted()) {
+    g_spool_ram_only = true;
+    BEE_SERIAL.println("spool: RAM only (LittleFS mount failed)");
+    return false;
+  }
+  if (!spool_verify_rw()) {
+    LittleFS.end();
+    LittleFS.format();
+    if (!LittleFS.begin(true) || !spool_verify_rw()) {
+      g_spool_ram_only = true;
+      BEE_SERIAL.println("spool: RAM only (LittleFS not writable)");
+      return false;
+    }
+  }
+  if (!LittleFS.exists(kSpoolPath) && !spool_create_file()) {
+    g_spool_ram_only = true;
+    BEE_SERIAL.println("spool: RAM only (spool file create failed)");
+    return false;
+  }
+  g_spool_fs_ok = true;
+  return true;
+}
+
+void ram_spool_push_line(const String& line) {
+  if (g_ram_spool_lines.size() >= kRamSpoolMaxLines) {
+    g_ram_spool_lines.erase(g_ram_spool_lines.begin());
+  }
+  g_ram_spool_lines.push_back(line);
+}
+
+void ram_spool_drop_head(size_t lines) {
+  if (lines >= g_ram_spool_lines.size()) {
+    g_ram_spool_lines.clear();
+    return;
+  }
+  g_ram_spool_lines.erase(g_ram_spool_lines.begin(),
+                          g_ram_spool_lines.begin() + static_cast<ptrdiff_t>(lines));
 }
 
 void spool_recount() {
   g_spool_pending_count = 0;
-  if (!LittleFS.exists(kSpoolPath)) {
+  if (!g_spool_fs_ok || !LittleFS.exists(kSpoolPath)) {
     return;
   }
   File f = LittleFS.open(kSpoolPath, "r");
@@ -517,6 +600,9 @@ void spool_recount() {
 }
 
 size_t littlefs_free_bytes() {
+  if (!g_spool_fs_ok || g_spool_ram_only) {
+    return 0;
+  }
   return LittleFS.totalBytes() - LittleFS.usedBytes();
 }
 
@@ -612,6 +698,9 @@ void spool_trim_if_needed() {
 }
 
 bool spool_append_line(const String& line) {
+  if (!g_spool_fs_ok || g_spool_ram_only) {
+    return false;
+  }
   if (g_spool_pending_count >= kSpoolSoftMaxLines || littlefs_free_bytes() < kSpoolCompactReserveBytes) {
     spool_trim_if_needed();
   }
@@ -693,7 +782,7 @@ bool post_batch_body(const String& body, size_t sample_count, JsonArray& accepte
   const String auth = String("Bearer ") + INGEST_TOKEN;
   int code = 0;
   String resp_body;
-  if (!uplink_http_post(url, auth, body, code, resp_body)) {
+  if (!uplink_http_post(url, auth, body, code, resp_body, kCellularBatchTimeoutMs)) {
     BEE_SERIAL.printf("POST /v1/telemetry/batch -> %d samples=%u\n", code,
                       static_cast<unsigned>(sample_count));
     if (resp_body.length() > 0) {
@@ -842,6 +931,14 @@ void append_v2_samples(JsonArray& samples, const ReportFrameV2& frame, const Str
     s["report_id"] = report_id;
     s["value"]["volts"] = decode_battery_volts(frame.battery_x100);
   }
+  if (frame.device_type == 1 && (frame.metrics_present & kMetricAudio)) {
+    JsonObject s = samples.add<JsonObject>();
+    s["device_public_id"] = device_id;
+    s["metric"] = "weight_kg";
+    s["ts"] = iso;
+    s["report_id"] = report_id;
+    s["value"]["kg"] = frame.audio_rms_x1000 / 100.0f;
+  }
   if (frame.metrics_present & kMetricFirmware) {
     JsonObject s = samples.add<JsonObject>();
     s["device_public_id"] = device_id;
@@ -864,8 +961,26 @@ String build_spool_line(const ReportFrameV2& frame, int8_t rx_rssi_dbm = -127) {
 
 void process_v2_item(const RxV2Item& item) {
   const String spool_line = build_spool_line(item.frame, item.rx_rssi_dbm);
+  if (g_spool_ram_only || !g_spool_fs_ok) {
+    ram_spool_push_line(spool_line);
+    BEE_SERIAL.printf("spool: RAM %u lines\n", static_cast<unsigned>(g_ram_spool_lines.size()));
+    g_drain_pending = true;
+    return;
+  }
   if (!spool_append_line(spool_line)) {
-    BEE_SERIAL.println("WARN: spool append failed");
+    ram_spool_push_line(spool_line);
+    BEE_SERIAL.printf("WARN: spool append failed — RAM %u lines\n",
+                      static_cast<unsigned>(g_ram_spool_lines.size()));
+  }
+  g_drain_pending = true;
+}
+
+void flush_pending_rx_to_storage() {
+  RxItem item{};
+  while (rx_queue_pop(item)) {
+    if (item.kind == RxKind::V2) {
+      process_v2_item(item.v2);
+    }
   }
 }
 
@@ -924,9 +1039,46 @@ void drop_corrupt_spool_head() {
 }
 
 /** Собирает один JSON batch из RAM-очереди и строк spool (без merge JsonDocument). */
+bool append_spool_json_line(const String& line, String& body_out, JsonArray& report_ids_out, bool& first_sample,
+                            size_t& sample_count_out) {
+  if (line.length() < 3) {
+    return false;
+  }
+  JsonDocument line_doc;
+  const DeserializationError err = deserializeJson(line_doc, line);
+  if (err) {
+    BEE_SERIAL.printf("WARN: spool line parse: %s\n", err.c_str());
+    return false;
+  }
+  JsonArray line_samples = line_doc["samples"].as<JsonArray>();
+  if (line_samples.size() == 0) {
+    return false;
+  }
+  const char* rid = line_doc["report_id"] | "";
+  if (rid[0] != '\0') {
+    report_ids_out.add(rid);
+  }
+  for (JsonObject s : line_samples) {
+    if (sample_count_out >= kMaxSamplesPerBatch) {
+      break;
+    }
+    if (!first_sample) {
+      body_out += ',';
+    }
+    String frag;
+    serializeJson(s, frag);
+    body_out += frag;
+    first_sample = false;
+    ++sample_count_out;
+  }
+  return true;
+}
+
+/** Собирает один JSON batch из RAM-очереди и строк spool (без merge JsonDocument). */
 bool build_uplink_body(String& body_out, JsonArray& report_ids_out, JsonDocument& ram_batch,
-                       size_t& spool_lines_out, size_t& sample_count_out) {
+                       size_t& spool_lines_out, size_t& ram_lines_out, size_t& sample_count_out) {
   spool_lines_out = 0;
+  ram_lines_out = 0;
   sample_count_out = 0;
   body_out = "{\"samples\":[";
   bool first_sample = true;
@@ -942,6 +1094,26 @@ bool build_uplink_body(String& body_out, JsonArray& report_ids_out, JsonDocument
       first_sample = false;
       ++sample_count_out;
     }
+  }
+
+  for (const String& line : g_ram_spool_lines) {
+    if (ram_lines_out + spool_lines_out >= kMaxSpoolLinesPerBatch ||
+        sample_count_out >= kMaxSamplesPerBatch) {
+      break;
+    }
+    if (append_spool_json_line(line, body_out, report_ids_out, first_sample, sample_count_out)) {
+      ++ram_lines_out;
+    }
+  }
+
+  if (!g_spool_fs_ok || g_spool_ram_only) {
+    if (sample_count_out == 0) {
+      return false;
+    }
+    body_out += ']';
+    append_gateway_batch_to_body(body_out);
+    body_out += '}';
+    return true;
   }
 
   drop_corrupt_spool_head();
@@ -965,43 +1137,15 @@ bool build_uplink_body(String& body_out, JsonArray& report_ids_out, JsonDocument
     return true;
   }
 
-  while (f.available() && spool_lines_out < kMaxSpoolLinesPerBatch &&
+  while (f.available() && spool_lines_out + ram_lines_out < kMaxSpoolLinesPerBatch &&
          sample_count_out < kMaxSamplesPerBatch) {
     String line = f.readStringUntil('\n');
     line.trim();
-    if (line.length() < 3) {
-      continue;
-    }
-
-    JsonDocument line_doc;
-    const DeserializationError err = deserializeJson(line_doc, line);
-    if (err) {
-      BEE_SERIAL.printf("WARN: spool line parse: %s\n", err.c_str());
+    if (append_spool_json_line(line, body_out, report_ids_out, first_sample, sample_count_out)) {
+      ++spool_lines_out;
+    } else if (line.length() >= 3) {
       break;
     }
-    JsonArray line_samples = line_doc["samples"].as<JsonArray>();
-    if (line_samples.size() == 0) {
-      continue;
-    }
-
-    const char* rid = line_doc["report_id"] | "";
-    if (rid[0] != '\0') {
-      report_ids_out.add(rid);
-    }
-    for (JsonObject s : line_samples) {
-      if (sample_count_out >= kMaxSamplesPerBatch) {
-        break;
-      }
-      if (!first_sample) {
-        body_out += ',';
-      }
-      String frag;
-      serializeJson(s, frag);
-      body_out += frag;
-      first_sample = false;
-      ++sample_count_out;
-    }
-    ++spool_lines_out;
   }
   f.close();
   if (sample_count_out == 0) {
@@ -1018,6 +1162,8 @@ void try_uplink() {
     return;
   }
 
+  flush_pending_rx_to_storage();
+
   JsonDocument ram_batch;
   flush_ram_queue(ram_batch);
 
@@ -1026,17 +1172,28 @@ void try_uplink() {
 
   String body;
   size_t spool_lines = 0;
+  size_t ram_lines = 0;
   size_t sample_count = 0;
-  if (!build_uplink_body(body, pending_report_ids, ram_batch, spool_lines, sample_count)) {
+  if (!build_uplink_body(body, pending_report_ids, ram_batch, spool_lines, ram_lines, sample_count)) {
+    BEE_SERIAL.printf("drain skip: ram=%u fs_ok=%d ram_only=%d\n",
+                      static_cast<unsigned>(g_ram_spool_lines.size()), g_spool_fs_ok ? 1 : 0,
+                      g_spool_ram_only ? 1 : 0);
     g_drain_backoff_ms = kDrainIntervalMs;
     return;
   }
 
+  BEE_SERIAL.printf("drain send: samples=%u body=%u B\n", static_cast<unsigned>(sample_count),
+                    static_cast<unsigned>(body.length()));
+
   JsonDocument accepted_doc;
   JsonArray accepted_ids = accepted_doc.to<JsonArray>();
   if (!post_batch_body(body, sample_count, accepted_ids)) {
-    g_drain_backoff_ms = min<uint32_t>(g_drain_backoff_ms * 2, 15U * 60U * 1000U);
+    g_drain_backoff_ms = min<uint32_t>(g_drain_backoff_ms * 2, kDrainBackoffMaxMs);
     return;
+  }
+
+  if (ram_lines > 0) {
+    ram_spool_drop_head(ram_lines);
   }
 
   if (spool_lines > 0) {
@@ -1045,8 +1202,9 @@ void try_uplink() {
     }
   }
 
-  BEE_SERIAL.printf("drain ok: spool_lines=%u samples=%u pending=%u free=%u B\n",
-                    static_cast<unsigned>(spool_lines), static_cast<unsigned>(sample_count),
+  BEE_SERIAL.printf("drain ok: ram_lines=%u spool_lines=%u samples=%u pending=%u free=%u B\n",
+                    static_cast<unsigned>(ram_lines), static_cast<unsigned>(spool_lines),
+                    static_cast<unsigned>(sample_count),
                     static_cast<unsigned>(g_spool_pending_count),
                     static_cast<unsigned>(littlefs_free_bytes()));
   g_drain_backoff_ms = kDrainIntervalMs;
@@ -1143,7 +1301,8 @@ void loop() {
     g_last_heartbeat_ms = now_ms;
   }
 
-  if (now_ms - g_last_drain_ms >= g_drain_backoff_ms) {
+  if (g_drain_pending || now_ms - g_last_drain_ms >= g_drain_backoff_ms) {
+    g_drain_pending = false;
     try_uplink();
     g_last_drain_ms = now_ms;
   }

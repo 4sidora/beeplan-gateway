@@ -14,10 +14,13 @@ bool uplink_ready();
  * Возвращает true при HTTP 2xx; status_code и response_body заполняются всегда.
  */
 bool uplink_http_post(const String& url, const String& authorization_header, const String& body,
-                      int& status_code, String& response_body);
+                      int& status_code, String& response_body, uint32_t timeout_ms = 0);
 
 /** RSSI Wi‑Fi или CSQ модема (dBm, -127 если нет). */
 int8_t uplink_signal_dbm();
 
 /** Канал Wi‑Fi для ESP-NOW. */
 uint8_t gateway_wifi_channel();
+
+/** Синхронизация UTC: NTP (Wi‑Fi) или время сети модема (GPRS). */
+void uplink_sync_time();
