@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <stdint.h>
 
 /** ESP-NOW v1 — one metric per frame (legacy). */
